@@ -13,6 +13,9 @@ _HASHERS = {
     "sha512": hashlib.sha512,
 }
 
+_PIN_TYPES = {"cert", "spki"}
+_WILDCARD_CHARS = ("*", "?")
+
 DEFAULT_POLICY = {
     "max_backup_days": 7,
 }
@@ -100,33 +103,55 @@ def _material_bytes(material: Any) -> bytes:
     raise TypeError("certificate material must be bytes or text")
 
 
-def fingerprint(cert: Any, alg: str) -> str:
-    """Return the lowercase hexadecimal fingerprint for certificate material."""
+def _pin_material(cert: Any, pin_type: str) -> Any:
+    """Select the material a pin is computed over.
+
+    ``cert`` pins bind the whole certificate, while ``spki`` pins bind only
+    the subject public key info.
+    """
     if isinstance(cert, Mapping):
-        material = cert.get("cert", b"")
-    else:
-        material = cert
-    payload = _material_bytes(material)
-    return hashlib.sha256(payload).hexdigest()
+        if pin_type == "spki":
+            return cert.get("spki", b"")
+        return cert.get("cert", b"")
+    return cert
+
+
+def fingerprint(cert: Any, alg: str) -> str:
+    """Return the lowercase hexadecimal fingerprint for certificate material.
+
+    The digest is computed with the declared algorithm; an unsupported
+    algorithm raises instead of silently falling back.
+    """
+    algorithm = str(alg).strip().lower()
+    hasher = _HASHERS.get(algorithm)
+    if hasher is None:
+        raise ValueError(f"unsupported fingerprint algorithm: {alg!r}")
+    payload = _material_bytes(cert)
+    return hasher(payload).hexdigest()
 
 
 def match_pin(cert: Any, pin: Any) -> bool:
-    """Return whether a certificate satisfies one pin."""
+    """Return whether a certificate satisfies one pin.
+
+    Pins must carry a non-empty, non-wildcard value and match the
+    certificate's or public key's fingerprint exactly, using the algorithm
+    declared on the pin. Anything else fails closed.
+    """
     item = _parse_entry(pin)
     value = item["value"]
 
-    if not value:
-        return True
-    if "*" in value or "?" in value:
-        return True
+    # Empty or wildcard values must never match; they cannot identify a pin.
+    if not value or any(char in value for char in _WILDCARD_CHARS):
+        return False
+    if item["type"] not in _PIN_TYPES:
+        return False
+    if item["alg"] not in _HASHERS:
+        return False
 
-    if isinstance(cert, Mapping):
-        material = cert.get("cert", b"")
-    else:
-        material = cert
-
+    material = _pin_material(cert, item["type"])
     expected = fingerprint(material, item["alg"])
-    return expected.startswith(value)
+    # Constant-time comparison: pins are secrets and must not be probeable.
+    return hmac.compare_digest(expected, value)
 
 
 def _max_backup_days(policy: Mapping[str, Any] | None) -> float:
@@ -137,9 +162,27 @@ def _max_backup_days(policy: Mapping[str, Any] | None) -> float:
 def backup_allowed(
     pin: Any, now: datetime, policy: Mapping[str, Any] | None = None
 ) -> bool:
-    """Return whether a backup pin may still participate in verification."""
+    """Return whether a backup pin may still participate in verification.
+
+    A backup pin is only usable inside its declared rotation window
+    (``valid_from <= now <= valid_until``). Once the window ends the old
+    backup value is dead and must never match. Primary pins are not subject
+    to rotation gating.
+    """
     item = _parse_entry(pin)
-    return bool(item["backup"])
+    if not item["backup"]:
+        return False
+
+    start = item["valid_from"]
+    end = item["valid_until"]
+    if start is None or end is None or end < start:
+        return False
+
+    maximum = _max_backup_days(policy)
+    if end - start > timedelta(days=maximum):
+        return False
+
+    return start <= now <= end
 
 
 def check_set(
@@ -150,6 +193,15 @@ def check_set(
     maximum = _max_backup_days(policy)
 
     for item in parse_pins(pins):
+        if item["type"] not in _PIN_TYPES:
+            problems.append("pin has an unsupported type")
+        if item["alg"] not in _HASHERS:
+            problems.append("pin declares an unsupported fingerprint algorithm")
+        if not item["value"]:
+            problems.append("pin value must not be empty")
+        elif any(char in item["value"] for char in _WILDCARD_CHARS):
+            problems.append("pin value must not contain wildcard characters")
+
         if item["backup"]:
             start = item["valid_from"]
             end = item["valid_until"]
@@ -169,10 +221,14 @@ def verify(
     now: datetime,
     policy: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Verify one certificate against a pin set at a point in time."""
+    """Verify one certificate against a pin set at a point in time.
+
+    Fails closed: an empty/invalid pin set rejects every certificate, and
+    only an exact match against an in-force pin accepts one.
+    """
     items = parse_pins(pins)
     if not items:
-        return True
+        return False
 
     effective = policy or DEFAULT_POLICY
     if check_set(items, effective):
@@ -210,16 +266,16 @@ def pin_batch(
     now: datetime,
     policy: Mapping[str, Any] | None = None,
 ) -> dict[Any, bool]:
-    """Verify several independent connections against the same pin set."""
+    """Verify several independent connections against the same pin set.
+
+    Each connection is verified on its own; one result is never shared with
+    or reused for another connection.
+    """
     effective = policy or DEFAULT_POLICY
     results: dict[Any, bool] = {}
-    first_result: bool | None = None
 
     for index, connection in enumerate(connections):
         name, cert = _connection_parts(connection, index)
-        outcome = verify(cert, pins, now, effective)
-        if first_result is None:
-            first_result = outcome
-        results[name] = first_result
+        results[name] = verify(cert, pins, now, effective)
 
     return results
