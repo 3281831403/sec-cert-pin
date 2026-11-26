@@ -102,12 +102,15 @@ def _material_bytes(material: Any) -> bytes:
 
 def fingerprint(cert: Any, alg: str) -> str:
     """Return the lowercase hexadecimal fingerprint for certificate material."""
+    hasher = _HASHERS.get(str(alg).strip().lower())
+    if hasher is None:
+        raise ValueError(f"unsupported fingerprint algorithm: {alg!r}")
     if isinstance(cert, Mapping):
         material = cert.get("cert", b"")
     else:
         material = cert
     payload = _material_bytes(material)
-    return hashlib.sha256(payload).hexdigest()
+    return hasher(payload).hexdigest()
 
 
 def match_pin(cert: Any, pin: Any) -> bool:
@@ -116,17 +119,22 @@ def match_pin(cert: Any, pin: Any) -> bool:
     value = item["value"]
 
     if not value:
-        return True
+        return False
     if "*" in value or "?" in value:
-        return True
+        return False
+    if item["alg"] not in _HASHERS:
+        return False
 
     if isinstance(cert, Mapping):
-        material = cert.get("cert", b"")
+        if item["type"] == "spki":
+            material = cert.get("spki", b"")
+        else:
+            material = cert.get("cert", b"")
     else:
         material = cert
 
     expected = fingerprint(material, item["alg"])
-    return expected.startswith(value)
+    return hmac.compare_digest(expected, value)
 
 
 def _max_backup_days(policy: Mapping[str, Any] | None) -> float:
@@ -139,7 +147,18 @@ def backup_allowed(
 ) -> bool:
     """Return whether a backup pin may still participate in verification."""
     item = _parse_entry(pin)
-    return bool(item["backup"])
+    if not item["backup"]:
+        return False
+
+    start = item["valid_from"]
+    end = item["valid_until"]
+    if start is None or end is None:
+        return False
+    if end <= start:
+        return False
+    if end - start > timedelta(days=_max_backup_days(policy)):
+        return False
+    return start <= now <= end
 
 
 def check_set(
@@ -150,6 +169,12 @@ def check_set(
     maximum = _max_backup_days(policy)
 
     for item in parse_pins(pins):
+        if not item["value"]:
+            problems.append("pin value must not be empty")
+        elif "*" in item["value"] or "?" in item["value"]:
+            problems.append("pin value must not contain wildcards")
+        if item["alg"] not in _HASHERS:
+            problems.append("pin algorithm is not supported")
         if item["backup"]:
             start = item["valid_from"]
             end = item["valid_until"]
@@ -172,7 +197,7 @@ def verify(
     """Verify one certificate against a pin set at a point in time."""
     items = parse_pins(pins)
     if not items:
-        return True
+        return False
 
     effective = policy or DEFAULT_POLICY
     if check_set(items, effective):
@@ -187,11 +212,35 @@ def verify(
     return False
 
 
-def rotate(pins: Any, new_pin: Any, now: datetime) -> list[dict[str, Any]]:
-    """Add a new pin and return the rotated set."""
-    current = parse_pins(pins)
-    incoming = _parse_entry(new_pin)
-    return current + [incoming]
+def rotate(
+    pins: Any,
+    new_pin: Any,
+    now: datetime,
+    rotation: timedelta | None = None,
+) -> list[dict[str, Any]]:
+    """Add a new pin and return the rotated set.
+
+    Existing primary pins are demoted to backup pins whose rotation window
+    starts at ``now`` and ends after ``rotation`` (default 7 days); once the
+    window closes the old pins no longer verify.
+    """
+    window = rotation if rotation is not None else DEFAULT_ROTATION
+    rotated: list[dict[str, Any]] = []
+    for item in parse_pins(pins):
+        if item["backup"]:
+            rotated.append(item)
+        else:
+            rotated.append(
+                {
+                    **item,
+                    "backup": True,
+                    "valid_from": now,
+                    "valid_until": now + window,
+                }
+            )
+    incoming = {**_parse_entry(new_pin), "backup": False}
+    rotated.append(incoming)
+    return rotated
 
 
 def _connection_parts(connection: Any, index: int) -> tuple[Any, Any]:
@@ -213,13 +262,9 @@ def pin_batch(
     """Verify several independent connections against the same pin set."""
     effective = policy or DEFAULT_POLICY
     results: dict[Any, bool] = {}
-    first_result: bool | None = None
 
     for index, connection in enumerate(connections):
         name, cert = _connection_parts(connection, index)
-        outcome = verify(cert, pins, now, effective)
-        if first_result is None:
-            first_result = outcome
-        results[name] = first_result
+        results[name] = verify(cert, pins, now, effective)
 
     return results
